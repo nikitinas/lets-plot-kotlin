@@ -5,12 +5,17 @@
 
 package jetbrains.letsPlot.api
 
+import jetbrains.datalore.plot.base.Aes
 import jetbrains.datalore.plot.config.Option
 import jetbrains.datalore.plot.config.Option.Meta.Kind.PLOT
-import jetbrains.letsPlot.intern.GeomKind
-import jetbrains.letsPlot.intern.PosKind
-import jetbrains.letsPlot.intern.StatKind
-import jetbrains.letsPlot.intern.filterNonNullValues
+import jetbrains.datalore.plot.config.Option.Scale.AES
+import jetbrains.datalore.plot.config.Option.Scale.DATE_TIME
+import jetbrains.letsPlot.Pos
+import jetbrains.letsPlot.Stat
+import jetbrains.letsPlot.ggsize
+import jetbrains.letsPlot.intern.*
+import jetbrains.letsPlot.intern.layer.PosOptions
+import jetbrains.letsPlot.intern.layer.StatOptions
 import kotlin.reflect.KProperty
 
 typealias Getter<C, T> = C.(C) -> T
@@ -41,15 +46,56 @@ class BindingsManager {
 
 }
 
+fun <C,T,P: BindableProperty<C,T>> P.set(values: Iterable<T>): P {
+    this.values = values
+    return this
+}
+
+fun <C,T,P: BindableProperty<C,T>> P.map(mapping: Getter<C, T>): P {
+    this.mapping = mapping
+    return this
+}
+
+operator fun <C,T,P: BindableProperty<C,T>> P.invoke(mapping: Getter<C, T>) = map(mapping)
+
+infix fun <C,T,P: BindableProperty<C,T>> P.to(mapping: Getter<C, T>) = map(mapping)
+
+infix fun <C,T,P: BindableProperty<C,T>> P.of(mapping: Getter<C, T>) = map(mapping)
+
+operator fun <C,T,P: BindableProperty<C,T>> P.invoke(values: Iterable<T>) = set(values)
+
+operator fun <C,T,P: BindableProperty<C,T>> P.minus(mapping: Getter<C, T>) = map(mapping)
+
 open class BindableProperty<C, T>(val name: String) {
 
     var mapping: Getter<C, T>? = null
 
-    operator fun invoke(mapping: Getter<C, T>) = map(mapping)
+    var values: Iterable<T>? = null
+}
 
-    fun map(mapping: Getter<C, T>) {
-        this.mapping = mapping
+class ScaleableProperty<C,T>(name: String, val aes: Aes<*>) : BindableProperty<C,T>(name) {
+
+    var scale: Scale? = null
+
+    fun datetime(
+        name: String? = null, breaks: List<Any>? = null,
+        labels: List<String>? = null,
+        limits: List<Any>? = null,
+        expand: Any? = null,
+        na_value: Any? = null
+    ) {
+        scale = Scale(
+            aes,
+            name, breaks, labels, limits, expand, na_value,
+            otherOptions = Options(
+                mapOf(
+                    DATE_TIME to true
+                )
+            )
+        )
     }
+
+
 }
 
 class WriteableProperty<C, T>(name: String) : BindableProperty<C, T>(name) {
@@ -58,6 +104,21 @@ class WriteableProperty<C, T>(name: String) : BindableProperty<C, T>(name) {
 
     operator fun invoke(value: T) = set(value)
 
+    infix fun to(value: T) = set(value)
+
+    infix fun of(value: T) = set(value)
+
+    operator fun minus(value: T) = set(value)
+
+    operator fun plusAssign(value: T) {
+        set(value)
+    }
+
+    operator fun compareTo(value: T): Int{
+        set(value)
+        return 0
+    }
+
     fun set(value: T) {
         this.constValue = value
     }
@@ -65,49 +126,48 @@ class WriteableProperty<C, T>(name: String) : BindableProperty<C, T>(name) {
 
 open class BuilderBase<T>(val bindings: DataBindings<T>) {
 
-    class WriteablePropertyProvider<C, T>(private val owner: BuilderBase<C>) {
-        operator fun getValue(thisRef: Any?, property: KProperty<*>): WriteableProperty<C, T> {
-            return owner.writeableProperties.getOrPut(property.name) { WriteableProperty<C, T>(property.name) } as WriteableProperty<C, T>
-        }
-    }
-
-    class BindablePropertyProvider<C, T>(private val owner: BuilderBase<C>) {
-        operator fun getValue(thisRef: Any?, property: KProperty<*>): BindableProperty<C, T> {
-            return owner.bindableProperties.getOrPut(property.name) { BindableProperty<C, T>(property.name) } as BindableProperty<C, T>
+    class PropertyProvider<C, T, P: BindableProperty<C,T>>(private val owner: BuilderBase<C>, val create: (String)->P) {
+        operator fun getValue(thisRef: Any?, property: KProperty<*>): P {
+            return owner.properties.getOrPut(property.name) { create(property.name) } as P
         }
     }
 
     val data: Iterable<T> get() = bindings.data
 
-    internal val writeableProperties = mutableMapOf<String, WriteableProperty<T, *>>()
+    internal val properties = mutableMapOf<String, BindableProperty<T, *>>()
 
-    internal val bindableProperties = mutableMapOf<String, BindableProperty<T, *>>()
+    protected fun <P> prop() = PropertyProvider<T, P, WriteableProperty<T,P>>(this){WriteableProperty(it)}
 
-    protected fun <P> prop() = WriteablePropertyProvider<T, P>(this)
+    protected fun <P> bindProp() = PropertyProvider<T, P, BindableProperty<T,P>>(this){BindableProperty(it)}
 
-    protected fun <P> bindProp() = BindablePropertyProvider<T, P>(this)
+    protected fun <P> scaleProp(aes: Aes<*>) = PropertyProvider<T, P, ScaleableProperty<T,P>>(this){ ScaleableProperty(it, aes) }
 
-    fun <P> map(selector: T.() -> P) = selector
+    fun <P> map(selector: Getter<T, P>) = selector
 
     internal open fun getSpec(): Map<String, Any> = collectParameters() + (Option.Plot.MAPPING to collectMappings())
 
     private fun collectParameters() =
-        writeableProperties.mapValues {
-            it.value.constValue
-        }.filterNonNullValues()
+        properties.mapValues { (it.value as? WriteableProperty<T,*>)?.constValue }
+            .filterNonNullValues()
 
     private fun collectMappings() =
-        (writeableProperties + bindableProperties).mapValues {
+        properties.mapValues {
             it.value.mapping?.let(bindings::getDataName)
         }.filterNonNullValues()
+
 }
 
 class PlotBuilder<T>(data: DataBindings<T>) : GenericBuilder<T>(data) {
 
-    val x by bindProp<Any>()
-    val y by bindProp<Any>()
+    val x by scaleProp<Any>(Aes.X)
+    val y by scaleProp<Any>(Aes.Y)
 
     private val layers = mutableListOf<BuilderBase<*>>()
+
+    private val otherFeatures = mutableListOf<OtherPlotFeature>()
+
+    private fun collectScales() =
+        properties.mapNotNull { (it.value as? ScaleableProperty<T,*>)?.scale }
 
     internal fun <C, B : BuilderBase<C>> addLayer(builder: B, body: B.() -> Unit) {
         layers.add(builder)
@@ -119,15 +179,20 @@ class PlotBuilder<T>(data: DataBindings<T>) : GenericBuilder<T>(data) {
     override fun getSpec() = super.getSpec() + mapOf(
         Option.Meta.KIND to PLOT,
         Option.Plot.LAYERS to layers.map { it.getSpec() },
-        Option.Plot.DATA to bindings.dataSource
-    )
+        Option.Plot.DATA to bindings.dataSource,
+        Option.Plot.SCALES to collectScales().map { it.toSpec() }
+    ) + otherFeatures.map { it.kind to it.toSpec()}
 
+    operator fun OtherPlotFeature.unaryPlus() {otherFeatures.add(this)}
 }
 
-fun <T> PlotBuilder<*>.lines(data: Iterable<T>, body: LinesLayer<T>.() -> Unit) =
+fun PlotBuilder<*>.size(width: Int, height: Int) =
+    +ggsize(width, height)
+
+fun <T> PlotBuilder<*>.line(data: Iterable<T>, body: LinesLayer<T>.() -> Unit) =
     addLayer(LinesLayer(createContext(data)), body)
 
-fun <T> PlotBuilder<T>.lines(body: LinesLayer<T>.() -> Unit = {}) = lines(data, body)
+fun <T> PlotBuilder<T>.line(body: LinesLayer<T>.() -> Unit = {}) = line(data, body)
 
 fun <T> PlotBuilder<*>.points(data: Iterable<T>, body: PointsLayer<T>.() -> Unit) =
     addLayer(PointsLayer(createContext(data)), body)
@@ -149,25 +214,45 @@ fun <T> PlotBuilder<*>.bars(data: Iterable<T>, body: BarsLayer<T>.() -> Unit) =
 
 fun <T> PlotBuilder<T>.bars(body: BarsLayer<T>.() -> Unit = {}) = bars(data, body)
 
+fun <T> PlotBuilder<*>.area(data: Iterable<T>, body: AreaLayer<T>.() -> Unit) =
+    addLayer(AreaLayer(createContext(data)), body)
+
+fun <T> PlotBuilder<T>.area(body: AreaLayer<T>.() -> Unit = {}) = area(data, body)
+
+fun <T> PlotBuilder<*>.density(data: Iterable<T>, body: DensityLayer<T>.() -> Unit) =
+    addLayer(DensityLayer(createContext(data)), body)
+
+fun <T> PlotBuilder<T>.density(body: DensityLayer<T>.() -> Unit = {}) = density(data, body)
+
+fun <T> PlotBuilder<*>.histogram(data: Iterable<T>, body: HistogramLayer<T>.() -> Unit) =
+    addLayer(HistogramLayer(createContext(data)), body)
+
+fun <T> PlotBuilder<T>.histogram(body: HistogramLayer<T>.() -> Unit = {}) = histogram(data, body)
+
 data class LayerContext<T>(val bindingsManager: DataBindings<T>, val plot: PlotBuilder<*>)
 
 open class LayerBuilder<T>(
     context: LayerContext<T>,
     private val geomKind: GeomKind,
-    var statKind: StatKind = StatKind.IDENTITY,
-    var posKind: PosKind = PosKind.IDENTITY
+    var stat: StatOptions = Stat.identity,
+    var position: PosOptions = Pos.identity
 ) : GenericBuilder<T>(context.bindingsManager) {
 
     private val plot: PlotBuilder<*> = context.plot
-    override fun getSpec() = super.getSpec() +
+    override fun getSpec() = (super.getSpec() +
             mapOf<String, Any>(
                 Option.Layer.GEOM to geomKind.optionName(),
-                Option.Layer.STAT to statKind.optionName(),
-                Option.Layer.POS to posKind.optionName()
-            ).let {
-                if (bindings.data != plot.bindings.data) it + (Option.Layer.DATA to bindings.dataSource)
-                else it
-            }
+                Option.Layer.STAT to stat.kind.optionName(),
+                Option.Layer.POS to position.kind.optionName()
+            ) + stat.parameters.map).let {
+        if (bindings.data != plot.bindings.data) it + (Option.Layer.DATA to bindings.dataSource)
+        else it
+    }
+
+    val density get() = Stat.density()
+    val count get() = Stat.count()
+    val bin get() = Stat.bin()
+    val boxplot get() = Stat.boxplot()
 }
 
 open class GenericBuilder<T>(bindings: DataBindings<T>) : BuilderBase<T>(bindings) {
@@ -177,13 +262,13 @@ open class GenericBuilder<T>(bindings: DataBindings<T>) : BuilderBase<T>(binding
 }
 
 open class XYNumbersLayer<T>(
-    context: LayerContext<T>, geomKind: GeomKind, statKind: StatKind = StatKind.IDENTITY,
-    posKind: PosKind = PosKind.IDENTITY
+    context: LayerContext<T>, geomKind: GeomKind, stat: StatOptions = Stat.identity,
+    position: PosOptions = Pos.identity
 ) :
-    LayerBuilder<T>(context, geomKind, statKind, posKind) {
+    LayerBuilder<T>(context, geomKind, stat, position) {
 
-    val x by prop<Number>()
-    val y by prop<Number>()
+    val x by bindProp<Any>()
+    val y by bindProp<Any>()
 }
 
 class LinesLayer<T>(context: LayerContext<T>) : XYNumbersLayer<T>(context, GeomKind.LINE) {
@@ -209,9 +294,32 @@ class HLinesLayer<T>(context: LayerContext<T>) : LayerBuilder<T>(context, GeomKi
     val linetype by prop<String>()
 }
 
-class BarsLayer<T>(context: LayerContext<T>) : LayerBuilder<T>(context, GeomKind.BAR, statKind = StatKind.COUNT, posKind = PosKind.STACK) {
-    val x by prop<Any>()
-    val y by prop<Any>()
+class BarsLayer<T>(context: LayerContext<T>) : LayerBuilder<T>(context, GeomKind.BAR, stat = Stat.count(), position = Pos.stack) {
+    val x by bindProp<Any>()
+    val y by bindProp<Any>()
+    val width by prop<Double>()
+    val size by prop<Double>()
+}
+
+class AreaLayer<T>(context: LayerContext<T>) : LayerBuilder<T>(context, GeomKind.AREA, position = Pos.stack) {
+    val x by bindProp<Double>()
+    val y by bindProp<Double>()
+    val linetype by prop<String>()
+    val size by prop<Double>()
+}
+
+class DensityLayer<T>(context: LayerContext<T>) :
+    LayerBuilder<T>(context, GeomKind.DENSITY, stat = Stat.density()) {
+    val x by bindProp<Double>()
+    val y by bindProp<Double>()
+    val width by prop<Double>()
+    val size by prop<Double>()
+}
+
+class HistogramLayer<T>(context: LayerContext<T>) :
+    LayerBuilder<T>(context, GeomKind.HISTOGRAM, stat = Stat.bin(), position = Pos.stack) {
+    val x by bindProp<Double>()
+    val y by bindProp<Double>()
     val width by prop<Double>()
     val size by prop<Double>()
 }
@@ -224,3 +332,18 @@ fun <T> Iterable<T>.lets_plot(body: PlotBuilder<T>.() -> Unit): PlotSpec {
 }
 
 data class PlotSpec(val spec: MutableMap<String, Any>)
+
+fun test() {
+    val data = listOf(1 to 2, 2 to 3)
+    data.lets_plot {
+        x { first }.datetime("date")
+        line {
+            x { first }
+            y to "a"
+        }
+        bars {
+            stat = density
+        }
+        +ggsize(100,10)
+    }
+}
